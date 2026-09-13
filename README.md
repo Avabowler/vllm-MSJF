@@ -1,6 +1,6 @@
 # MSJF：基于输出长度预测的 vLLM 内存感知调度
 
-本仓库是基于 [vLLM](https://github.com/vllm-project/vllm)（基线 commit `22258a26b`）的研究性修改，
+本仓库是基于 [vLLM](https://github.com/vllm-project/vllm)（基线 commit `22258a26b`）的预测生成长度并进行调度优化实现，
 实现 **MSJF（memory-aware shortest job first）调度**：复用 LLM 自身 prefill 隐状态预测输出长度，
 按预测 KV 足迹排序排队请求，并以"预约制准入"控制内存，从而消除抢占、降低 JCT/TTFT。
 
@@ -23,8 +23,6 @@
 3. **预约制准入**：running 请求按"预测完整序列还需要的块数 × λ（`--msjf-reservation-factor`，
    默认 0.8）"记预约账，新准入要求 `空闲块 − Σ预约 ≥ 门块数`。预约随请求接近完成自动缩水，
    对预测误差鲁棒（实验：σ=0.5 噪声下仍 0 抢占）。
-4. **低估修正与可观测性**：实际输出超过预测时按 `--msjf-overrun-factor`（1.25）上调并重排；
-   新增 5 个 Prometheus 指标（预约块数、准入推迟、低估请求数、预测 MAE、桶准确率）。
 
 ## 快速开始
 
@@ -59,38 +57,6 @@ vllm serve <model> --scheduling-policy msjf \
 预测注入通道（client/oracle 用）：OpenAI 请求体 `"kv_transfer_params": {"output_len_prediction": N}`，
 或 `SamplingParams.extra_args["output_len_prediction"]`。PD 分离下 P 节点 `mlp` 预测自动随
 `kv_transfer_params` 传给 D 节点，排队前即可用（零传输层改动）。
-
-## 代码改动清单
-
-以基线 `22258a26b` 为准（`git diff 22258a26b --stat --ignore-cr-at-eol`）：**13 个修改文件（+919/−7 行）+ 8 个新增文件**。
-
-### 修改的文件
-
-| 文件 | 改动 |
-|---|---|
-| `vllm/config/scheduler.py` | `SchedulerPolicy` 增加 `msjf`；新增 7 个 `msjf_*` 配置字段 |
-| `vllm/config/vllm.py`、`vllm/config/__init__.py` | `VllmConfig.length_predictor_config` 字段与导出 |
-| `vllm/engine/arg_utils.py` | 全部新参数的 CLI 接线；修复 `create_engine_config` 漏传 `length_predictor_config` 的接线 bug |
-| `vllm/v1/request.py` | 请求级预测字段 + `_init_length_prediction()`（从 `extra_args`/`kv_transfer_params` 注入） |
-| `vllm/v1/core/sched/request_queue.py` | `MSJFRequestQueue`：按 `msjf_cost` 的小顶堆，支持重排与惰性失效 |
-| `vllm/v1/core/sched/scheduler.py` | 核心集成：MSJF 准入闸、预约记账、老化、低估修正、预测摄入（约 +317 行） |
-| `vllm/v1/outputs.py` | `ModelRunnerOutput.predicted_output_lens` 透传 |
-| `vllm/v1/metrics/stats.py`、`vllm/v1/metrics/loggers.py` | 5 个新指标（日志 + Prometheus） |
-| `vllm/v1/worker/gpu_model_runner.py` | 预测头集成（旧 runner 路径） |
-| `vllm/v1/worker/gpu/model_runner.py` | 同上逻辑向重构后 runner 的移植（服务实际路径）；增量跨 chunk 加权池化 |
-| `tests/v1/core/utils.py` | 测试基建支持预测注入 |
-
-### 新增的文件
-
-| 文件 | 内容 |
-|---|---|
-| `vllm/config/length_predictor.py` | `LengthPredictorConfig` |
-| `vllm/v1/core/sched/length_predictor.py` | 调度侧估计回退链（显式预测 → EWMA → max_tokens）+ 精度统计 |
-| `vllm/v1/worker/length_predictor_head.py` | 预测头网络（加权池化 + 桶分类）与 safetensors 加载 |
-| `tests/v1/core/test_msjf_scheduler.py` | 调度层单测 13 例 |
-| `tests/v1/worker/test_length_predictor_head.py` | 预测头 CPU 单测 7 例 |
-| `examples/output_length_prediction/train_length_predictor.py` | 预测头训练（冻结主干） |
-| `benchmarks/output_length_scheduling/` | 压测客户端、数据集转换、实验报告与结果 JSON |
 
 ## 实验结果
 
@@ -170,27 +136,6 @@ python -m pytest tests/v1/core/test_msjf_scheduler.py \
                   tests/v1/worker/test_length_predictor_head.py \
                   tests/v1/core/test_scheduler.py -v
 ```
-
-## 已知限制与遗留工作
-
-- 预测头仅集成 V1 GPU model runner（V2 路径未接，届时 `mlp` 静默降级为 mean/max_tokens 兜底）。
-- 单机模式下 `mlp` 预测晚于排队（排序靠 EWMA 兜底）；PD 分离完整形态（1P1D + nixl 实测）为推荐
-  目标，尚未验证。
-- MSJF 不与 `priority` 组合；speculative decoding 未做专项组合测试。
-- 训练/评估均在 ultrachat 分布，跨分布（LongAlign）未重训预测头。
-- 优化路线图（期望值解码、分位数桶、自适应 λ、prefix-caching 感知足迹等）见
-  [EXPERIMENT_REPORT_FULL.md §8](benchmarks/output_length_scheduling/EXPERIMENT_REPORT_FULL.md)。
-
-## 文档索引
-
-| 文档 | 内容 |
-|---|---|
-| [IMPLEMENTATION_REPORT.md](benchmarks/output_length_scheduling/IMPLEMENTATION_REPORT.md) | 实现报告：三组件设计、单机/PD 数据流图、修改清单明细、与论文偏离对照 |
-| [EXPERIMENTS.md](benchmarks/output_length_scheduling/EXPERIMENTS.md) | 实验手册：E1–E6 快速起步、完整对比/消融矩阵、逐条命令 |
-| [EXPERIMENT_REPORT_FULL.md](benchmarks/output_length_scheduling/EXPERIMENT_REPORT_FULL.md) | 完整实验报告：两组实验全量数据、判读、调参指南、路线图 |
-| [VALIDATION_2026-09-12.md](benchmarks/output_length_scheduling/VALIDATION_2026-09-12.md) | 端到端验证报告 v2：预测头训练、修复清单（含接线 bug 与 runner 移植）、E1–E6 复核 |
-| [results/](benchmarks/output_length_scheduling/results/) | 全部结果 JSON（含修复前归档 `archive_pre_wiring_fix/`） |
-
 ## License
 
 沿用上游 vLLM 的 [Apache License 2.0](LICENSE)。
