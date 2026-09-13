@@ -48,6 +48,7 @@ from vllm.config import (
     KernelConfig,
     KVEventsConfig,
     KVTransferConfig,
+    LengthPredictorConfig,
     LoadConfig,
     LoRAConfig,
     MambaConfig,
@@ -643,6 +644,14 @@ class EngineArgs:
 
     watermark: float = SchedulerConfig.watermark
 
+    msjf_reservation_factor: float = SchedulerConfig.msjf_reservation_factor
+    msjf_cost_mode: str = SchedulerConfig.msjf_cost_mode
+    msjf_full_fit_mode: bool = SchedulerConfig.msjf_full_fit_mode
+    msjf_high_watermark: float = SchedulerConfig.msjf_high_watermark
+    msjf_max_backfill_skips: int = SchedulerConfig.msjf_max_backfill_skips
+    msjf_overrun_factor: float = SchedulerConfig.msjf_overrun_factor
+    msjf_aging_factor: float = SchedulerConfig.msjf_aging_factor
+
     disable_hybrid_kv_cache_manager: bool | None = (
         SchedulerConfig.disable_hybrid_kv_cache_manager
     )
@@ -704,6 +713,7 @@ class EngineArgs:
 
     kv_transfer_config: KVTransferConfig | None = None
     kv_events_config: KVEventsConfig | None = None
+    length_predictor_config: LengthPredictorConfig | None = None
 
     ec_transfer_config: ECTransferConfig | None = None
     ec_manager_config: EncoderCacheManagerConfig = get_field(
@@ -1620,6 +1630,29 @@ class EngineArgs:
         )
         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
         scheduler_group.add_argument(
+            "--msjf-reservation-factor",
+            **scheduler_kwargs["msjf_reservation_factor"],
+        )
+        scheduler_group.add_argument(
+            "--msjf-cost-mode", **scheduler_kwargs["msjf_cost_mode"]
+        )
+        scheduler_group.add_argument(
+            "--msjf-full-fit-mode", **scheduler_kwargs["msjf_full_fit_mode"]
+        )
+        scheduler_group.add_argument(
+            "--msjf-high-watermark", **scheduler_kwargs["msjf_high_watermark"]
+        )
+        scheduler_group.add_argument(
+            "--msjf-max-backfill-skips",
+            **scheduler_kwargs["msjf_max_backfill_skips"],
+        )
+        scheduler_group.add_argument(
+            "--msjf-overrun-factor", **scheduler_kwargs["msjf_overrun_factor"]
+        )
+        scheduler_group.add_argument(
+            "--msjf-aging-factor", **scheduler_kwargs["msjf_aging_factor"]
+        )
+        scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
@@ -1693,6 +1726,9 @@ class EngineArgs:
         )
         vllm_group.add_argument(
             "--kv-transfer-config", **vllm_kwargs["kv_transfer_config"]
+        )
+        vllm_group.add_argument(
+            "--length-predictor-config", **vllm_kwargs["length_predictor_config"]
         )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
         vllm_group.add_argument(
@@ -2425,6 +2461,13 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            msjf_reservation_factor=self.msjf_reservation_factor,
+            msjf_cost_mode=self.msjf_cost_mode,
+            msjf_full_fit_mode=self.msjf_full_fit_mode,
+            msjf_high_watermark=self.msjf_high_watermark,
+            msjf_max_backfill_skips=self.msjf_max_backfill_skips,
+            msjf_overrun_factor=self.msjf_overrun_factor,
+            msjf_aging_factor=self.msjf_aging_factor,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
@@ -2649,6 +2692,8 @@ class EngineArgs:
             reasoning_config=self.reasoning_config,
             profiler_config=self.profiler_config,
             additional_config=self.additional_config,
+            # fix: 原实现漏传，导致 length_predictor_config 无法从 CLI 到达引擎
+            length_predictor_config=self.length_predictor_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,

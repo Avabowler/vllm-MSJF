@@ -1,0 +1,27 @@
+{
+  "config": {
+    "host": "localhost",
+    "port": 8000,
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "dataset": "/root/autodl-tmp/data/uc.jsonl",
+    "num_prompts": 512,
+    "request_rate": 20.0,
+    "prediction": "oracle",
+    "noise_sigma": 0.25,
+    "max_tokens": 2048,
+    "ignore_eos": true,
+    "seed": 0,
+    "output": "benchmarks/output_length_scheduling/results/E4_msjf_fullfit_r20_seed0.json"
+  },
+  "completed": 512,
+  "request_rate": 20.0,
+  "duration_s": 98.71,
+  "output_throughput_tps": 1764.7,
+  "jct_mean_s": 28.166,
+  "jct_p50_s": 19.45,
+  "jct_p99_s": 93.102,
+  "ttft_mean_s": 24.309,
+  "ttft_p50_s": 16.047,
+  "ttft_p99_s": 86.423,
+  "preemptions": 0
+}

@@ -38,6 +38,7 @@ from .engram import EngramConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
+from .length_predictor import LengthPredictorConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
 from .mamba import MambaBackendEnum, MambaConfig
@@ -411,6 +412,9 @@ class VllmConfig:
     """Profiling configuration."""
     kv_transfer_config: KVTransferConfig | None = None
     """The configurations for distributed KV cache transfer."""
+    length_predictor_config: LengthPredictorConfig | None = None
+    """The configuration for output-length prediction used by length-aware
+    scheduling (the "msjf" scheduling policy)."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None

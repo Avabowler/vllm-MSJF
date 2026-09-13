@@ -285,6 +285,24 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("Preemptions: %d")
             log_args.append(self.num_preemptions)
 
+        if self.last_scheduler_stats.msjf_reserved_blocks > 0:
+            log_parts.append("MSJF reserved blocks: %d")
+            log_args.append(self.last_scheduler_stats.msjf_reserved_blocks)
+        if self.last_scheduler_stats.num_msjf_gate_deferrals > 0:
+            log_parts.append("MSJF gate deferrals: %d")
+            log_args.append(self.last_scheduler_stats.num_msjf_gate_deferrals)
+        if self.last_scheduler_stats.num_msjf_underestimated > 0:
+            log_parts.append("MSJF underestimations: %d")
+            log_args.append(self.last_scheduler_stats.num_msjf_underestimated)
+        if self.last_scheduler_stats.length_prediction_mae is not None:
+            log_parts.append("Pred len MAE: %.1f tok")
+            log_args.append(self.last_scheduler_stats.length_prediction_mae)
+        if self.last_scheduler_stats.length_prediction_bucket_accuracy is not None:
+            log_parts.append("Pred bucket acc: %.1f%%")
+            log_args.append(
+                self.last_scheduler_stats.length_prediction_bucket_accuracy * 100
+            )
+
         log_parts.extend(
             [
                 "GPU KV cache usage: %.1f%%",
@@ -567,6 +585,72 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
+        )
+
+        #
+        # Length-aware scheduling (MSJF)
+        #
+        gauge_msjf_reserved_blocks = self._gauge_cls(
+            name="vllm:msjf_reserved_blocks",
+            documentation=(
+                "KV blocks reserved for running requests' predicted future "
+                "demand under the msjf scheduling policy."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_msjf_reserved_blocks = create_metric_per_engine(
+            gauge_msjf_reserved_blocks, per_engine_labelvalues
+        )
+
+        counter_msjf_gate_deferrals = self._counter_cls(
+            name="vllm:msjf_gate_deferrals",
+            documentation=(
+                "Waiting requests deferred by the msjf admission gate "
+                "(including best-fit backfill skips)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_msjf_gate_deferrals = create_metric_per_engine(
+            counter_msjf_gate_deferrals, per_engine_labelvalues
+        )
+
+        counter_msjf_underestimated = self._counter_cls(
+            name="vllm:msjf_underestimated_requests",
+            documentation=(
+                "Requests whose actual output length exceeded the predicted "
+                "output length under the msjf scheduling policy."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_msjf_underestimated = create_metric_per_engine(
+            counter_msjf_underestimated, per_engine_labelvalues
+        )
+
+        gauge_msjf_pred_mae = self._gauge_cls(
+            name="vllm:length_prediction_mae_tokens",
+            documentation=(
+                "Mean absolute error (tokens) of the output-length predictor "
+                "over finished requests with a prediction."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_msjf_pred_mae = create_metric_per_engine(
+            gauge_msjf_pred_mae, per_engine_labelvalues
+        )
+
+        gauge_msjf_pred_bucket_acc = self._gauge_cls(
+            name="vllm:length_prediction_bucket_accuracy",
+            documentation=(
+                "Fraction of finished requests whose output-length bucket "
+                "prediction was correct."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_msjf_pred_bucket_acc = create_metric_per_engine(
+            gauge_msjf_pred_bucket_acc, per_engine_labelvalues
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1034,6 +1118,24 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            self.gauge_msjf_reserved_blocks[engine_idx].set(
+                scheduler_stats.msjf_reserved_blocks
+            )
+            self.counter_msjf_gate_deferrals[engine_idx].inc(
+                scheduler_stats.num_msjf_gate_deferrals
+            )
+            self.counter_msjf_underestimated[engine_idx].inc(
+                scheduler_stats.num_msjf_underestimated
+            )
+            if scheduler_stats.length_prediction_mae is not None:
+                self.gauge_msjf_pred_mae[engine_idx].set(
+                    scheduler_stats.length_prediction_mae
+                )
+            if scheduler_stats.length_prediction_bucket_accuracy is not None:
+                self.gauge_msjf_pred_bucket_acc[engine_idx].set(
+                    scheduler_stats.length_prediction_bucket_accuracy
+                )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

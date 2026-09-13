@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "msjf"]
 
 
 @config
@@ -141,10 +141,55 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "msjf" means memory-aware shortest job first: waiting requests are
+      ordered by their estimated KV cache footprint
+      (prompt length + predicted output length) and admission is throttled by
+      the predicted future memory demand of running requests. Requires output
+      length predictions to be useful; see vllm.config.length_predictor."""
+
+    msjf_reservation_factor: float = Field(default=0.8, ge=0.0, le=2.0)
+    """Fraction of running requests' predicted remaining KV demand that new
+    admissions must leave free. 0.0 disables reservation-based admission
+    control (ordering only); 1.0 is fully conservative."""
+
+    msjf_cost_mode: str = Field(default="footprint", pattern="^(footprint|output)$")
+    """Ordering cost for the MSJF queue. 'footprint' (default) ranks by
+    prompt + predicted output (estimated KV footprint, memory-aware SJF);
+    'output' ranks by predicted output length only, degenerating to plain
+    output-length SJF. Mostly for A/B benchmarking against SJF baselines."""
+
+    msjf_full_fit_mode: bool = False
+    """If True, use the paper-style strict admission: a waiting request is
+    admitted only when its full predicted sequence
+    (prompt + predicted output length) fits in the unreserved free blocks,
+    instead of only reserving the first chunk plus running requests' predicted
+    demand. More preemption-resistant, but pessimistic predictions lower
+    utilization."""
+
+    msjf_high_watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """KV cache usage fraction above which new admissions are paused entirely
+    so running decodes can drain (backstop against preemption cascades when
+    predictions are bad). 0.0 disables."""
+
+    msjf_max_backfill_skips: int = Field(default=4, ge=0)
+    """Maximum number of waiting requests skipped per step when the queue head
+    fails the MSJF admission gate, so smaller-footprint requests further down
+    the queue can backfill (best-fit packing). 0 disables backfill."""
+
+    msjf_overrun_factor: float = Field(default=1.25, ge=1.0)
+    """When a request generates more tokens than its (effective) predicted
+    output length, the estimate is escalated to
+    ``num_output_tokens * msjf_overrun_factor`` (clamped to max_tokens) and
+    its scheduling cost is re-sorted."""
+
+    msjf_aging_factor: float = Field(default=0.0, ge=0.0)
+    """Tokens of scheduling cost subtracted per second of queue wait time, so
+    long jobs are not starved indefinitely by a stream of short ones. 0.0
+    disables aging. Applied only under the "msjf" policy."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

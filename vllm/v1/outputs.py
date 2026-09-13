@@ -369,6 +369,11 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # Length-aware scheduling (MSJF): req_id -> (bucket, predicted_output_len,
+    # rank_score), emitted by the output-length predictor head when a request's
+    # prefill completes. ``None`` when length prediction is disabled.
+    predicted_output_lens: dict[str, tuple[int, int, float]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

@@ -209,6 +209,22 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Output-length prediction for length-aware scheduling (MSJF).
+        # Populated here from the client/piggyback channels and later by the
+        # predictor backend (see Scheduler._apply_output_len_prediction).
+        self.predicted_output_len: int | None = None
+        self.predicted_bucket: int = -1
+        self.predicted_rank_score: float = 0.0
+        # Scheduling estimate used by length-aware policies: the prediction,
+        # escalated when actual generation exceeds it. None until the
+        # scheduler initializes it.
+        self.effective_output_len: int | None = None
+        self.output_len_underestimated = False
+        # Estimated KV footprint in tokens (prompt + effective output length);
+        # the sort key of the MSJF waiting queue.
+        self.msjf_cost: float = 0.0
+        self._init_length_prediction()
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         # Per-request speculative-decoding acceptance accumulator. Populated by
@@ -233,6 +249,29 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+
+    def _init_length_prediction(self) -> None:
+        """Ingest client-supplied or P/D-piggybacked output length predictions.
+
+        Sources, in order: ``SamplingParams.extra_args["output_len_prediction"]``
+        (client/oracle backends) and ``kv_transfer_params["output_len_prediction"]``
+        (relayed from a prefill node in a disaggregated deployment)."""
+        sources: list[dict[str, Any]] = []
+        if self.sampling_params is not None and self.sampling_params.extra_args:
+            sources.append(self.sampling_params.extra_args)
+        if self.kv_transfer_params:
+            sources.append(self.kv_transfer_params)
+        for source in sources:
+            prediction = source.get("output_len_prediction")
+            if prediction is not None:
+                self.predicted_output_len = int(prediction)
+                bucket = source.get("output_len_bucket")
+                if bucket is not None:
+                    self.predicted_bucket = int(bucket)
+                rank_score = source.get("output_len_rank_score")
+                if rank_score is not None:
+                    self.predicted_rank_score = float(rank_score)
+                break
 
     @classmethod
     def from_engine_core_request(

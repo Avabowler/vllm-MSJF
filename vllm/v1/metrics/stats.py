@@ -213,6 +213,16 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Length-aware scheduling (MSJF).
+    # Blocks reserved for running requests' predicted future KV demand.
+    msjf_reserved_blocks: int = 0
+    # Cumulative counters.
+    num_msjf_gate_deferrals: int = 0
+    num_msjf_underestimated: int = 0
+    # Output-length prediction quality (None when no predictions yet).
+    length_prediction_mae: float | None = None
+    length_prediction_bucket_accuracy: float | None = None
+
 
 @dataclass
 class RequestStateStats:

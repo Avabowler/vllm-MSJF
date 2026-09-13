@@ -39,6 +39,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.length_predictor import LengthPredictor
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -48,6 +49,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    MSJFRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -78,6 +80,14 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level fallbacks for length-aware scheduling: some tests build
+    # instances via object.__new__ and only initialize what they exercise.
+    use_msjf = False
+    length_predictor: LengthPredictor | None = None
+    msjf_reserved_blocks = 0
+    msjf_gate_deferrals = 0
+    num_msjf_underestimated = 0
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -204,6 +214,33 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        # Length-aware scheduling (MSJF): predicts output lengths and budgets
+        # KV memory accordingly.
+        self.use_msjf = self.policy == SchedulingPolicy.MSJF
+        if self.use_msjf:
+            from vllm.config import LengthPredictorConfig
+
+            predictor_config = (
+                vllm_config.length_predictor_config or LengthPredictorConfig()
+            )
+            if predictor_config.backend == "none":
+                logger.warning(
+                    "The 'msjf' scheduling policy is enabled without an output "
+                    "length predictor backend. Requests fall back to "
+                    "SamplingParams.max_tokens as the length estimate, which "
+                    "degenerates to shortest-max_tokens-first scheduling. "
+                    "Consider --length-predictor-config to enable a backend."
+                )
+            self.length_predictor = LengthPredictor(predictor_config)
+            self.msjf_reserved_blocks = 0
+            self.msjf_gate_deferrals = 0
+            self.num_msjf_underestimated = 0
+        else:
+            self.length_predictor = None
+            self.msjf_reserved_blocks = 0
+            self.msjf_gate_deferrals = 0
+            self.num_msjf_underestimated = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -601,6 +638,11 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Length-aware scheduling: refresh aged costs, then compute the
+        # reservation for running requests' predicted future KV demand.
+        self._apply_msjf_aging(time.time())
+        self.msjf_reserved_blocks = self._msjf_running_reserved_blocks()
+
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -850,6 +892,7 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            backfill_skips = 0
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -858,6 +901,16 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    break
+
+                if (
+                    self.use_msjf
+                    and self.scheduler_config.msjf_high_watermark > 0.0
+                    and self.kv_cache_manager.usage
+                    > self.scheduler_config.msjf_high_watermark
+                ):
+                    # Memory-adaptive backstop: pause admissions and let the
+                    # running decodes drain instead of preempting them.
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1124,6 +1177,26 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                    # MSJF admission gate: require enough unreserved free
+                    # blocks for this request's footprint (first chunk in
+                    # reservation mode, full predicted sequence in full-fit
+                    # mode) so running decodes don't get preempted later.
+                    if self.use_msjf and not self._msjf_admission_allowed(
+                        request, num_new_tokens
+                    ):
+                        if (
+                            backfill_skips
+                            < self.scheduler_config.msjf_max_backfill_skips
+                        ):
+                            # Best-fit backfill: a later request with a
+                            # smaller chunk footprint may still fit.
+                            backfill_skips += 1
+                            self.msjf_gate_deferrals += 1
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
+                        break
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1173,6 +1246,18 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if (
+                        self.use_msjf
+                        and backfill_skips
+                        < self.scheduler_config.msjf_max_backfill_skips
+                    ):
+                        # Best-fit backfill: a later request with a smaller
+                        # chunk footprint may still fit.
+                        backfill_skips += 1
+                        self.msjf_gate_deferrals += 1
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1926,6 +2011,18 @@ class Scheduler(SchedulerInterface):
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
 
+        # Length-aware scheduling: ingest output-length predictions produced
+        # by the model-runner predictor head. Runs before the request loop so
+        # requests finishing in this very step already carry the prediction
+        # (e.g. a P/D prefill node relaying it via kv_transfer_params).
+        predicted_output_lens = model_runner_output.predicted_output_lens
+        if predicted_output_lens:
+            for pred_req_id, prediction in predicted_output_lens.items():
+                if pred_req_id in self.requests:
+                    pred_request = self.requests[pred_req_id]
+                    if not pred_request.is_finished():
+                        self._apply_output_len_prediction(pred_request, prediction)
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2041,6 +2138,35 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # Length-aware scheduling: the request outgrew its prediction.
+            # Escalate the estimate (never beyond max_tokens) and re-sort the
+            # waiting queues so the admission gates account for the higher
+            # future KV demand.
+            if (
+                self.use_msjf
+                and request.effective_output_len is not None
+                and len(request._output_token_ids) > request.effective_output_len
+            ):
+                if not request.output_len_underestimated:
+                    request.output_len_underestimated = True
+                    self.num_msjf_underestimated += 1
+                escalated = min(
+                    int(
+                        len(request._output_token_ids)
+                        * self.scheduler_config.msjf_overrun_factor
+                    ),
+                    request.max_tokens,
+                )
+                if escalated > request.effective_output_len:
+                    request.effective_output_len = escalated
+                    request.msjf_cost = self._msjf_cost(
+                        request.num_prompt_tokens, escalated
+                    )
+                    if isinstance(self.waiting, MSJFRequestQueue):
+                        self.waiting.update_request(request)
+                    if isinstance(self.skipped_waiting, MSJFRequestQueue):
+                        self.skipped_waiting.update_request(request)
+
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
             ):
@@ -2126,6 +2252,10 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if self.length_predictor is not None:
+                        # Feed the actual output length to the predictor
+                        # (running mean + accuracy tracking).
+                        self.length_predictor.record(request)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2323,10 +2453,18 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
-        # PRIORITY mode: compare queue heads when both queues are non-empty.
+        # PRIORITY/MSJF mode: compare queue heads when both queues are
+        # non-empty.
         if self.waiting and self.skipped_waiting:
             waiting_req = self.waiting.peek_request()
             skipped_req = self.skipped_waiting.peek_request()
+            if self.policy == SchedulingPolicy.MSJF:
+                # Order by estimated KV footprint (msjf_cost).
+                return (
+                    self.waiting
+                    if waiting_req.msjf_cost <= skipped_req.msjf_cost
+                    else self.skipped_waiting
+                )
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
@@ -2475,6 +2613,157 @@ class Scheduler(SchedulerInterface):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
 
+    ########################################################################
+    # Length-aware scheduling (MSJF) helpers
+    ########################################################################
+
+    def _init_msjf_cost(self, request: Request) -> None:
+        """Initialize the MSJF cost (estimated KV footprint in tokens).
+
+        ``effective_output_len`` is the predicted total output length; the
+        estimate falls back to the observed output-length mean and then to
+        ``request.max_tokens`` when no prediction is available yet."""
+        assert self.length_predictor is not None
+        estimate = self.length_predictor.estimate(request)
+        if estimate is None:
+            estimate = request.max_tokens
+        request.effective_output_len = min(max(estimate, 0), request.max_tokens)
+        request.msjf_cost = self._msjf_cost(
+            request.num_prompt_tokens, request.effective_output_len
+        )
+
+    def _msjf_cost(self, prompt_tokens: int, output_estimate: int) -> float:
+        """MSJF queue ordering cost.
+
+        'footprint' (default): prompt + predicted output = estimated KV
+        footprint (memory-aware SJF). 'output': predicted output only,
+        degenerating to plain output-length SJF (SJF-vs-MSJF ablation)."""
+        if self.scheduler_config.msjf_cost_mode == "output":
+            return float(output_estimate)
+        return float(prompt_tokens + output_estimate)
+
+    def _apply_output_len_prediction(
+        self, request: Request, prediction: tuple[int, int, float]
+    ) -> None:
+        """Attach a prediction (bucket, length, rank score) to a request.
+
+        Used to ingest predictions produced asynchronously by the model-runner
+        predictor head. Predictions relayed from a prefill node arrive via
+        kv_transfer_params and are handled at Request construction time."""
+        bucket, predicted_len, rank_score = prediction
+        request.predicted_bucket = bucket
+        request.predicted_output_len = predicted_len
+        request.predicted_rank_score = rank_score
+        if not self.use_msjf:
+            return
+        # Only escalate: never shrink an estimate an admission decision was
+        # already based on.
+        new_estimate = min(max(predicted_len, 0), request.max_tokens)
+        base = request.effective_output_len
+        if base is None:
+            self._init_msjf_cost(request)
+        elif new_estimate > base:
+            request.effective_output_len = new_estimate
+            request.msjf_cost = float(request.num_prompt_tokens + new_estimate)
+        if isinstance(self.waiting, MSJFRequestQueue):
+            self.waiting.update_request(request)
+        if isinstance(self.skipped_waiting, MSJFRequestQueue):
+            self.skipped_waiting.update_request(request)
+
+    def _apply_msjf_aging(self, now: float) -> None:
+        """Discount waiting costs with queue wait time to avoid starvation."""
+        factor = self.scheduler_config.msjf_aging_factor
+        if not self.use_msjf or factor <= 0.0:
+            return
+        for queue in (self.waiting, self.skipped_waiting):
+            for request in list(queue):
+                base = request.num_prompt_tokens + (
+                    request.effective_output_len
+                    if request.effective_output_len is not None
+                    else request.max_tokens
+                )
+                aged = max(
+                    base - factor * (now - request.arrival_time),
+                    float(request.num_prompt_tokens),
+                )
+                if aged != request.msjf_cost:
+                    request.msjf_cost = aged
+                    if isinstance(queue, MSJFRequestQueue):
+                        queue.update_request(request)
+
+    def _msjf_running_reserved_blocks(self) -> int:
+        """Reservation for the future KV demand of running requests.
+
+        For each running request, the blocks it is still expected to allocate
+        until its (effective) predicted full sequence, summed and scaled by
+        ``msjf_reservation_factor``. New admissions must leave this headroom
+        free, so admission tightens as running requests drift above their
+        predictions and opens up as they complete."""
+        if not self.use_msjf or self.scheduler_config.msjf_reservation_factor <= 0.0:
+            return 0
+        total = 0
+        for request in self.running:
+            predicted_remaining = self._msjf_predicted_remaining_blocks(request)
+            if predicted_remaining > 0:
+                total += predicted_remaining
+        return int(self.scheduler_config.msjf_reservation_factor * total)
+
+    def _msjf_predicted_remaining_blocks(self, request: Request) -> int:
+        """Blocks `request` is still expected to need until its predicted
+        full sequence (prompt + effective output length)."""
+        assert self.length_predictor is not None
+        effective = request.effective_output_len
+        if effective is None:
+            return 0
+        full_num_tokens = min(request.num_prompt_tokens + effective, self.max_model_len)
+        if full_num_tokens <= request.num_tokens:
+            return 0
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=request.num_computed_tokens,
+            num_local_computed_tokens=request.num_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            # The reservation must reflect the full predicted demand; the
+            # admission cap (which bounds the input-sequence fit against the
+            # pool sizer) must not clip it.
+            apply_admission_cap=False,
+        )
+
+    def _msjf_admission_allowed(self, request: Request, num_new_tokens: int) -> bool:
+        """Whether `request` fits alongside the reserved future demand."""
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        required = (
+            self._msjf_admission_gate_blocks(request, num_new_tokens)
+            + self.kv_cache_manager.watermark_blocks
+        )
+        return free_blocks - self.msjf_reserved_blocks >= required
+
+    def _msjf_admission_gate_blocks(self, request: Request, num_new_tokens: int) -> int:
+        """Blocks the MSJF admission gate requires to be unreserved-free.
+
+        Default (reservation mode): the first chunk plus the scaled future
+        demand of running requests. ``msjf_full_fit_mode`` switches to the
+        paper-style check that the full predicted sequence fits."""
+        if self.scheduler_config.msjf_full_fit_mode:
+            effective = (
+                request.effective_output_len
+                if request.effective_output_len is not None
+                else request.max_tokens
+            )
+            tokens = (
+                min(
+                    request.num_prompt_tokens + effective,
+                    self.max_model_len,
+                )
+                - request.num_computed_tokens
+            )
+        else:
+            tokens = num_new_tokens + self.num_lookahead_tokens
+        return (tokens + self.block_size - 1) // self.block_size
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -2492,6 +2781,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if self.use_msjf:
+                self._init_msjf_cost(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
@@ -2789,6 +3080,11 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.to_dict() if kv_connector_stats else None
         )
+        length_prediction_mae = None
+        length_prediction_bucket_accuracy = None
+        if self.length_predictor is not None:
+            length_prediction_mae = self.length_predictor.mean_abs_error
+            length_prediction_bucket_accuracy = self.length_predictor.bucket_accuracy
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -2801,6 +3097,11 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            msjf_reserved_blocks=self.msjf_reserved_blocks,
+            num_msjf_gate_deferrals=self.msjf_gate_deferrals,
+            num_msjf_underestimated=self.num_msjf_underestimated,
+            length_prediction_mae=length_prediction_mae,
+            length_prediction_bucket_accuracy=length_prediction_bucket_accuracy,
         )
 
     def make_spec_decoding_stats(
@@ -2900,6 +3201,21 @@ class Scheduler(SchedulerInterface):
         else:
             delay_free, kv_xfer_params = self.connector.request_finished_all_groups(
                 request, block_ids
+            )
+
+        # Length-aware scheduling: relay the output-length prediction to the
+        # next hop (e.g. a P/D decode node, whose scheduler consumes it before
+        # admission) via the free-form kv_transfer_params channel.
+        if request.predicted_output_len is not None:
+            if kv_xfer_params is None:
+                kv_xfer_params = {}
+            kv_xfer_params.setdefault(
+                "output_len_prediction", request.predicted_output_len
+            )
+            if request.predicted_bucket >= 0:
+                kv_xfer_params.setdefault("output_len_bucket", request.predicted_bucket)
+            kv_xfer_params.setdefault(
+                "output_len_rank_score", request.predicted_rank_score
             )
         return delay_free or partial_tail_delay, kv_xfer_params
 

@@ -221,6 +221,11 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+from vllm.v1.worker.length_predictor_head import (
+    IncrementalWeightedPooling,
+    WeightedPoolingHead,
+    load_length_predictor_head,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -722,6 +727,13 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+
+        # Output-length predictor head (length-aware scheduling / MSJF).
+        # Instantiated in load_model() once the model dtype/device are known.
+        self.length_predictor_config = vllm_config.length_predictor_config
+        self.length_predictor_head: WeightedPoolingHead | None = None
+        # req_id -> incremental weighted pooling across prefill chunks.
+        self.pending_pred_len_pooling: dict[str, IncrementalWeightedPooling] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -3711,6 +3723,7 @@ class GPUModelRunner(
         list[str],
         dict[str, int],
         list[int],
+        dict[str, tuple[int, int, float]] | None,
     ]:
         num_nans: torch.Tensor | None = None
         num_nans_in_logits: dict[str, int] = {}
@@ -3835,6 +3848,12 @@ class GPUModelRunner(
             scheduler_output.num_scheduled_tokens,
         )
 
+        # Output-length prediction for length-aware scheduling (MSJF).
+        predicted_output_lens = self._predict_output_lens(
+            hidden_states[:num_scheduled_tokens],
+            scheduler_output.num_scheduled_tokens,
+        )
+
         return (
             num_nans_in_logits,
             num_nans,
@@ -3844,6 +3863,7 @@ class GPUModelRunner(
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
+            predicted_output_lens,
         )
 
     @contextmanager
@@ -4745,6 +4765,7 @@ class GPUModelRunner(
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
+                predicted_output_lens,
             ) = self._bookkeeping_sync(
                 scheduler_output,
                 sampler_output,
@@ -4800,6 +4821,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                predicted_output_lens=predicted_output_lens,
             )
 
         if not self.use_async_scheduling:
@@ -5391,6 +5413,22 @@ class GPUModelRunner(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                # Output-length predictor head (length-aware scheduling).
+                # Loaded after the main model so dtype/device/hidden_size are
+                # known. Weights are tiny (a few FC layers), replicated on
+                # every TP rank.
+                if (
+                    self.length_predictor_config is not None
+                    and self.length_predictor_config.backend == "mlp"
+                ):
+                    self.length_predictor_head = load_length_predictor_head(
+                        config=self.length_predictor_config,
+                        hidden_size=self.model_config.get_hidden_size(),
+                        # Fully resolved by the time the model has loaded.
+                        dtype=cast(torch.dtype, self.model_config.dtype),
+                        device=self.device,
+                    )
+
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement
@@ -5749,9 +5787,72 @@ class GPUModelRunner(
 
         return prompt_logprobs_dict
 
+    def _predict_output_lens(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, tuple[int, int, float]] | None:
+        """Predict output lengths for requests whose prefill completes now.
+
+        Prompt hidden states are pooled incrementally across prefill chunks
+        (weighted pooling is linear); the MLP head runs once, on the final
+        chunk. Returns req_id -> (bucket, predicted_output_len, rank_score),
+        or None when the predictor is disabled."""
+        head = self.length_predictor_head
+        if head is None:
+            return None
+        assert self.length_predictor_config is not None
+        predicted: dict[str, tuple[int, int, float]] = {}
+        completed_req_ids: list[str] = []
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            if req_id not in self.requests:
+                continue
+            req_state = self.requests[req_id]
+            num_prompt_tokens = req_state.num_prompt_tokens
+            start_idx = req_state.num_computed_tokens
+            if start_idx >= num_prompt_tokens:
+                # Decoding or prompt embeddings: nothing to pool.
+                continue
+            end_idx = min(start_idx + num_tokens, num_prompt_tokens)
+            if end_idx <= start_idx:
+                continue
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            offset = self.query_start_loc.np[req_idx].item()
+            chunk_hidden = hidden_states[offset : offset + (end_idx - start_idx)]
+
+            if start_idx == 0 and req_id in self.pending_pred_len_pooling:
+                # Prefill restarted (e.g. after a preemption): start over.
+                del self.pending_pred_len_pooling[req_id]
+            if req_id in self.pending_pred_len_pooling:
+                pooling = self.pending_pred_len_pooling[req_id]
+            else:
+                pooling = IncrementalWeightedPooling(
+                    hidden_states.shape[-1], hidden_states.device
+                )
+                self.pending_pred_len_pooling[req_id] = pooling
+            pooling.update(chunk_hidden, head.score_tokens(chunk_hidden))
+            if end_idx >= num_prompt_tokens:
+                completed_req_ids.append(req_id)
+
+        for req_id in completed_req_ids:
+            pooling = self.pending_pred_len_pooling.pop(req_id)
+            pooled = pooling.finalize(next(head.parameters()).dtype)
+            bucket_logits, rank_score = head.predict(pooled)
+            bucket = int(bucket_logits.argmax().item())
+            cfg = self.length_predictor_config
+            predicted_len = int((bucket + 0.5) * cfg.max_output_len / cfg.num_buckets)
+            predicted[req_id] = (bucket, predicted_len, float(rank_score.item()))
+
+        # Drop pooling state for requests that left the batch mid-prefill.
+        if self.pending_pred_len_pooling:
+            stale = [r for r in self.pending_pred_len_pooling if r not in self.requests]
+            for r in stale:
+                del self.pending_pred_len_pooling[r]
+
+        return predicted or None
+
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
         """Count NaNs per request, reading the result back to the host.
-
         Only used under sync scheduling, The async path keeps the counts
         on device instead; see`AsyncGPUModelRunnerOutput`.
         """

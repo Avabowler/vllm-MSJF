@@ -22,7 +22,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -82,6 +82,11 @@ from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.length_predictor_head import (
+    IncrementalWeightedPooling,
+    WeightedPoolingHead,
+    load_length_predictor_head,
+)
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -244,6 +249,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Dual batch overlap. Created in initialize_kv_cache(), once everything
         # it runs the microbatched forward with exists.
         self.ubatch_runner: UBatchRunner | None = None
+
+        # Output-length predictor head (length-aware scheduling / MSJF).
+        # Ported from vllm/v1/worker/gpu_model_runner.py (the refactored
+        # gpu/model_runner.py path never had the wiring). Instantiated in
+        # load_model() once the model dtype/device are known.
+        self.length_predictor_config = vllm_config.length_predictor_config
+        self.length_predictor_head: WeightedPoolingHead | None = None
+        # req_id -> incremental weighted pooling across prefill chunks.
+        self.pending_pred_len_pooling: dict[str, IncrementalWeightedPooling] = {}
 
         # Detect EP all2all peer faults to prevent emitting corrupted output.
         # Only meaningful for MoE + DP with an FT-capable all2all backend.
@@ -430,6 +444,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
         )
+
+        # Output-length predictor head (length-aware scheduling / MSJF).
+        # Loaded after the main model so dtype/device/hidden_size are known.
+        if (
+            self.length_predictor_config is not None
+            and self.length_predictor_config.backend == "mlp"
+        ):
+            self.length_predictor_head = load_length_predictor_head(
+                config=self.length_predictor_config,
+                hidden_size=self.model_config.get_hidden_size(),
+                # Fully resolved by the time the model has loaded.
+                dtype=cast(torch.dtype, self.model_config.dtype),
+                device=self.device,
+            )
 
         # Initialize the components that require the model.
         self.model_state = init_model_state(
@@ -1934,6 +1962,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     @step_eplb_after()
+    def _predict_output_lens(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> dict[str, tuple[int, int, float]] | None:
+        """Predict output lengths for requests whose prefill completes now.
+
+        Ported from vllm/v1/worker/gpu_model_runner.py, adapted to the
+        refactored batch structures (input_batch/req_states arrays).
+        Prompt hidden states are pooled incrementally across prefill chunks
+        (weighted pooling is linear); the MLP head runs once, on the final
+        chunk. Returns req_id -> (bucket, predicted_output_len, rank_score),
+        or None when the predictor is disabled."""
+        head = self.length_predictor_head
+        if head is None:
+            return None
+        assert self.length_predictor_config is not None
+        cfg = self.length_predictor_config
+
+        idx_map = input_batch.idx_mapping_np
+        prompt_lens = self.req_states.prompt_len.np[idx_map]
+        computed_prefill = input_batch.num_computed_prefill_tokens_np
+        num_sched = input_batch.num_scheduled_tokens
+        query_loc = input_batch.query_start_loc_np
+
+        predicted: dict[str, tuple[int, int, float]] = {}
+        for i, req_id in enumerate(input_batch.req_ids):
+            n_prompt = int(prompt_lens[i])
+            computed = int(computed_prefill[i])
+            n_sched = int(num_sched[i])
+            if computed >= n_prompt or n_sched <= 0:
+                # Decoding or nothing scheduled this step: nothing to pool.
+                continue
+            # First chunk after (re)start: drop any stale pooling state
+            # (e.g. leftover from a preempted prefill attempt).
+            if computed == 0 and req_id in self.pending_pred_len_pooling:
+                del self.pending_pred_len_pooling[req_id]
+            pooling = self.pending_pred_len_pooling.get(req_id)
+            if pooling is None:
+                pooling = IncrementalWeightedPooling(
+                    hidden_states.shape[-1], hidden_states.device
+                )
+                self.pending_pred_len_pooling[req_id] = pooling
+            start = int(query_loc[i])
+            end = int(query_loc[i + 1])
+            chunk_hidden = hidden_states[start:end]
+            pooling.update(chunk_hidden, head.score_tokens(chunk_hidden))
+            if computed + n_sched >= n_prompt:
+                # Prefill completes in this step: run the head once.
+                pooling = self.pending_pred_len_pooling.pop(req_id)
+                pooled = pooling.finalize(next(head.parameters()).dtype)
+                bucket_logits, rank_score = head.predict(pooled)
+                bucket = int(bucket_logits.argmax().item())
+                predicted_len = int(
+                    (bucket + 0.5) * cfg.max_output_len / cfg.num_buckets
+                )
+                predicted[req_id] = (bucket, predicted_len, float(rank_score.item()))
+        return predicted or None
+
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
@@ -2008,8 +2095,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prompt_len.np,
         )
 
+        # Output-length prediction for length-aware scheduling (MSJF).
+        predicted_output_lens = self._predict_output_lens(hidden_states, input_batch)
+
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
+            predicted_output_lens=predicted_output_lens,
             req_ids=input_batch.req_ids,
             # NOTE(woosuk): req_id_to_index is unused in this model runner.
             # Only for compatibility with the existing model runner and scheduler.

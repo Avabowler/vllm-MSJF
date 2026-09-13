@@ -9,6 +9,7 @@ from vllm.config import (
     CacheConfig,
     ECTransferConfig,
     KVTransferConfig,
+    LengthPredictorConfig,
     ModelConfig,
     MultiModalConfig,
     ObservabilityConfig,
@@ -76,6 +77,7 @@ def create_scheduler(
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
+    length_predictor_config: "LengthPredictorConfig | None" = None,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -186,6 +188,7 @@ def create_scheduler(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        length_predictor_config=length_predictor_config,
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
         ),
@@ -233,6 +236,8 @@ def create_requests(
     same_prompt: bool = False,
     block_size: int = 16,
     req_ids: list[str] | None = None,
+    output_len_predictions: list[int] | None = None,
+    max_tokens_list: list[int] | None = None,
 ) -> list[Request]:
     global _none_hash_initialized
     if not _none_hash_initialized:
@@ -267,6 +272,11 @@ def create_requests(
     else:
         req_ids = [f"{i}" for i in range(num_requests)]
 
+    if output_len_predictions is not None:
+        assert len(output_len_predictions) == num_requests
+    if max_tokens_list is not None:
+        assert len(max_tokens_list) == num_requests
+
     for i in range(num_requests):
         mm_features = []
 
@@ -298,10 +308,25 @@ def create_requests(
             mm_features.append(mm_feature)
 
         prompt_token_ids = [0] * num_tokens if same_prompt else [i] * num_tokens
+        extra_args = None
+        if output_len_predictions is not None:
+            # The client/oracle prediction channel.
+            extra_args = {"output_len_prediction": output_len_predictions[i]}
+        request_max_tokens = (
+            max_tokens_list[i] if max_tokens_list is not None else max_tokens
+        )
+        sampling_params_i = SamplingParams(
+            ignore_eos=ignore_eos,
+            max_tokens=request_max_tokens,
+            stop_token_ids=stop_token_ids,
+            prompt_logprobs=prompt_logprobs,
+            extra_args=extra_args,
+        )
+        sampling_params_i.update_from_generation_config({}, EOS_TOKEN_ID)
         request = Request(
             request_id=req_ids[i],
             prompt_token_ids=prompt_token_ids,
-            sampling_params=sampling_params,
+            sampling_params=sampling_params_i,
             pooling_params=None,
             mm_features=mm_features if mm_features else None,
             block_hasher=block_hasher,

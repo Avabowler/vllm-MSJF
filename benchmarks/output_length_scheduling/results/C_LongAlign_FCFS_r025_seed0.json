@@ -1,0 +1,426 @@
+{
+  "config": {
+    "host": "localhost",
+    "port": 8000,
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "dataset": "/root/autodl-tmp/data/longalign_256.jsonl",
+    "num_prompts": 64,
+    "request_rate": 0.25,
+    "prediction": "oracle",
+    "noise_sigma": 0.25,
+    "max_tokens": 2048,
+    "ignore_eos": true,
+    "seed": 0,
+    "output": "benchmarks/output_length_scheduling/results/C_LongAlign_FCFS_r025_seed0.json"
+  },
+  "completed": 64,
+  "request_rate": 0.25,
+  "duration_s": 107.91,
+  "output_throughput_tps": 114.2,
+  "jct_mean_s": 54.85,
+  "jct_p99_s": 94.82,
+  "ttft_mean_s": 50.24,
+  "ttft_p99_s": 91.075,
+  "preemptions": 0,
+  "prompt_len_groups": {
+    "short(<2k)": null,
+    "mid(2k-8k)": {
+      "n": 9,
+      "jct_mean_s": 61.813,
+      "jct_p99_s": 91.658,
+      "ttft_mean_s": 57.043
+    },
+    "long(8k+)": {
+      "n": 55,
+      "jct_mean_s": 53.711,
+      "jct_p99_s": 94.82,
+      "ttft_mean_s": 49.126
+    }
+  },
+  "requests": [
+    {
+      "prompt_len": 22542,
+      "output_len": 82,
+      "e2e": 79.653,
+      "ttft": 78.002
+    },
+    {
+      "prompt_len": 8179,
+      "output_len": 157,
+      "e2e": 70.063,
+      "ttft": 66.175
+    },
+    {
+      "prompt_len": 10835,
+      "output_len": 227,
+      "e2e": 37.573,
+      "ttft": 32.207
+    },
+    {
+      "prompt_len": 23183,
+      "output_len": 296,
+      "e2e": 26.243,
+      "ttft": 17.638
+    },
+    {
+      "prompt_len": 23358,
+      "output_len": 186,
+      "e2e": 49.414,
+      "ttft": 46.506
+    },
+    {
+      "prompt_len": 7820,
+      "output_len": 303,
+      "e2e": 40.084,
+      "ttft": 31.469
+    },
+    {
+      "prompt_len": 10950,
+      "output_len": 69,
+      "e2e": 67.956,
+      "ttft": 67.152
+    },
+    {
+      "prompt_len": 10118,
+      "output_len": 66,
+      "e2e": 21.902,
+      "ttft": 21.145
+    },
+    {
+      "prompt_len": 7352,
+      "output_len": 202,
+      "e2e": 42.843,
+      "ttft": 37.72
+    },
+    {
+      "prompt_len": 12696,
+      "output_len": 91,
+      "e2e": 58.542,
+      "ttft": 55.31
+    },
+    {
+      "prompt_len": 7940,
+      "output_len": 91,
+      "e2e": 87.338,
+      "ttft": 84.62
+    },
+    {
+      "prompt_len": 12097,
+      "output_len": 99,
+      "e2e": 44.358,
+      "ttft": 42.453
+    },
+    {
+      "prompt_len": 8810,
+      "output_len": 190,
+      "e2e": 22.415,
+      "ttft": 19.442
+    },
+    {
+      "prompt_len": 9256,
+      "output_len": 183,
+      "e2e": 71.309,
+      "ttft": 65.794
+    },
+    {
+      "prompt_len": 10850,
+      "output_len": 245,
+      "e2e": 64.693,
+      "ttft": 59.053
+    },
+    {
+      "prompt_len": 10604,
+      "output_len": 309,
+      "e2e": 20.623,
+      "ttft": 13.611
+    },
+    {
+      "prompt_len": 14741,
+      "output_len": 301,
+      "e2e": 94.82,
+      "ttft": 86.338
+    },
+    {
+      "prompt_len": 6412,
+      "output_len": 253,
+      "e2e": 91.658,
+      "ttft": 88.931
+    },
+    {
+      "prompt_len": 12086,
+      "output_len": 276,
+      "e2e": 78.796,
+      "ttft": 71.326
+    },
+    {
+      "prompt_len": 10258,
+      "output_len": 108,
+      "e2e": 85.317,
+      "ttft": 83.472
+    },
+    {
+      "prompt_len": 31232,
+      "output_len": 252,
+      "e2e": 30.05,
+      "ttft": 25.658
+    },
+    {
+      "prompt_len": 7708,
+      "output_len": 289,
+      "e2e": 73.669,
+      "ttft": 65.059
+    },
+    {
+      "prompt_len": 17723,
+      "output_len": 194,
+      "e2e": 88.087,
+      "ttft": 83.0
+    },
+    {
+      "prompt_len": 11152,
+      "output_len": 200,
+      "e2e": 65.893,
+      "ttft": 61.145
+    },
+    {
+      "prompt_len": 16152,
+      "output_len": 49,
+      "e2e": 38.284,
+      "ttft": 37.198
+    },
+    {
+      "prompt_len": 9261,
+      "output_len": 182,
+      "e2e": 7.515,
+      "ttft": 2.349
+    },
+    {
+      "prompt_len": 10788,
+      "output_len": 203,
+      "e2e": 42.002,
+      "ttft": 35.349
+    },
+    {
+      "prompt_len": 12772,
+      "output_len": 189,
+      "e2e": 63.117,
+      "ttft": 58.094
+    },
+    {
+      "prompt_len": 6929,
+      "output_len": 224,
+      "e2e": 91.144,
+      "ttft": 86.597
+    },
+    {
+      "prompt_len": 23425,
+      "output_len": 211,
+      "e2e": 93.275,
+      "ttft": 89.574
+    },
+    {
+      "prompt_len": 13350,
+      "output_len": 232,
+      "e2e": 44.541,
+      "ttft": 39.339
+    },
+    {
+      "prompt_len": 9648,
+      "output_len": 141,
+      "e2e": 81.912,
+      "ttft": 78.188
+    },
+    {
+      "prompt_len": 10665,
+      "output_len": 219,
+      "e2e": 22.837,
+      "ttft": 18.988
+    },
+    {
+      "prompt_len": 12690,
+      "output_len": 200,
+      "e2e": 74.799,
+      "ttft": 70.477
+    },
+    {
+      "prompt_len": 9422,
+      "output_len": 199,
+      "e2e": 57.635,
+      "ttft": 51.826
+    },
+    {
+      "prompt_len": 10685,
+      "output_len": 168,
+      "e2e": 7.676,
+      "ttft": 1.518
+    },
+    {
+      "prompt_len": 14109,
+      "output_len": 203,
+      "e2e": 70.884,
+      "ttft": 64.774
+    },
+    {
+      "prompt_len": 9287,
+      "output_len": 210,
+      "e2e": 34.726,
+      "ttft": 31.191
+    },
+    {
+      "prompt_len": 15233,
+      "output_len": 242,
+      "e2e": 83.482,
+      "ttft": 75.896
+    },
+    {
+      "prompt_len": 14857,
+      "output_len": 284,
+      "e2e": 67.991,
+      "ttft": 60.14
+    },
+    {
+      "prompt_len": 6282,
+      "output_len": 75,
+      "e2e": 3.522,
+      "ttft": 0.661
+    },
+    {
+      "prompt_len": 10462,
+      "output_len": 292,
+      "e2e": 48.307,
+      "ttft": 40.269
+    },
+    {
+      "prompt_len": 11964,
+      "output_len": 178,
+      "e2e": 85.461,
+      "ttft": 79.986
+    },
+    {
+      "prompt_len": 12623,
+      "output_len": 219,
+      "e2e": 18.122,
+      "ttft": 13.098
+    },
+    {
+      "prompt_len": 19601,
+      "output_len": 226,
+      "e2e": 36.15,
+      "ttft": 30.75
+    },
+    {
+      "prompt_len": 15016,
+      "output_len": 218,
+      "e2e": 87.065,
+      "ttft": 81.119
+    },
+    {
+      "prompt_len": 14252,
+      "output_len": 145,
+      "e2e": 9.977,
+      "ttft": 8.293
+    },
+    {
+      "prompt_len": 12827,
+      "output_len": 203,
+      "e2e": 59.948,
+      "ttft": 53.63
+    },
+    {
+      "prompt_len": 15157,
+      "output_len": 254,
+      "e2e": 15.647,
+      "ttft": 11.03
+    },
+    {
+      "prompt_len": 10916,
+      "output_len": 149,
+      "e2e": 93.138,
+      "ttft": 91.075
+    },
+    {
+      "prompt_len": 15149,
+      "output_len": 278,
+      "e2e": 75.082,
+      "ttft": 68.853
+    },
+    {
+      "prompt_len": 8921,
+      "output_len": 264,
+      "e2e": 44.469,
+      "ttft": 36.257
+    },
+    {
+      "prompt_len": 10133,
+      "output_len": 93,
+      "e2e": 3.453,
+      "ttft": 1.852
+    },
+    {
+      "prompt_len": 8383,
+      "output_len": 216,
+      "e2e": 28.996,
+      "ttft": 26.578
+    },
+    {
+      "prompt_len": 10116,
+      "output_len": 108,
+      "e2e": 47.579,
+      "ttft": 43.406
+    },
+    {
+      "prompt_len": 16343,
+      "output_len": 151,
+      "e2e": 90.209,
+      "ttft": 87.837
+    },
+    {
+      "prompt_len": 32292,
+      "output_len": 310,
+      "e2e": 12.499,
+      "ttft": 6.521
+    },
+    {
+      "prompt_len": 6407,
+      "output_len": 163,
+      "e2e": 55.991,
+      "ttft": 52.15
+    },
+    {
+      "prompt_len": 10302,
+      "output_len": 75,
+      "e2e": 63.937,
+      "ttft": 62.811
+    },
+    {
+      "prompt_len": 21269,
+      "output_len": 127,
+      "e2e": 54.603,
+      "ttft": 51.216
+    },
+    {
+      "prompt_len": 13671,
+      "output_len": 184,
+      "e2e": 76.649,
+      "ttft": 73.303
+    },
+    {
+      "prompt_len": 11537,
+      "output_len": 242,
+      "e2e": 52.803,
+      "ttft": 47.101
+    },
+    {
+      "prompt_len": 8648,
+      "output_len": 211,
+      "e2e": 90.531,
+      "ttft": 86.015
+    },
+    {
+      "prompt_len": 15395,
+      "output_len": 121,
+      "e2e": 61.159,
+      "ttft": 56.798
+    }
+  ]
+}

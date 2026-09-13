@@ -18,6 +18,10 @@ from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.kernel import KernelConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
+from vllm.config.length_predictor import (
+    LengthPredictorBackend,
+    LengthPredictorConfig,
+)
 from vllm.config.load import LoadConfig
 from vllm.config.lora import LoRAConfig
 from vllm.config.mamba import MambaConfig
@@ -93,6 +97,9 @@ __all__ = [
     "KVTransferConfig",
     # From vllm.config.load
     "LoadConfig",
+    # From vllm.config.length_predictor
+    "LengthPredictorBackend",
+    "LengthPredictorConfig",
     # From vllm.config.lora
     "LoRAConfig",
     # From vllm.config.mamba
